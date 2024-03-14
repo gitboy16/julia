@@ -20,6 +20,10 @@ Base
 """
 parentmodule(m::Module) = ccall(:jl_module_parent, Ref{Module}, (Any,), m)
 
+# NOTE: overridden in loading.jl and compiler/utilities.jl
+# we need a definition early to allow inferring `show` methods
+is_root_module(m::Module) = m === Core || m === Base || m === Main
+
 """
     moduleroot(m::Module) -> Module
 
