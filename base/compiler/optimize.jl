@@ -527,45 +527,9 @@ function any_stmt_may_throw(ir::IRCode, bb::Int)
     return false
 end
 
-mutable struct LazyAugmentedDomtrees
-    const ir::IRCode
-    cfg::CFG
-    domtree::DomTree
-    postdomtree::PostDomTree
-    LazyAugmentedDomtrees(ir::IRCode) = new(ir)
-end
-
-function get!(lazyagdomtrees::LazyAugmentedDomtrees, sym::Symbol)
-    isdefined(lazyagdomtrees, sym) && return getfield(lazyagdomtrees, sym)
-    if sym === :cfg
-        return lazyagdomtrees.cfg = construct_augmented_cfg(lazyagdomtrees.ir)
-    elseif sym === :domtree
-        return lazyagdomtrees.domtree = construct_domtree(get!(lazyagdomtrees, :cfg))
-    elseif sym === :postdomtree
-        return lazyagdomtrees.postdomtree = construct_postdomtree(get!(lazyagdomtrees, :cfg))
-    else
-        error("invalid field access")
-    end
-end
-
-function construct_augmented_cfg(ir::IRCode)
-    cfg = copy(ir.cfg)
-    # Add a virtual basic block to represent the single exit
-    push!(cfg.blocks, BasicBlock(StmtRange(0:-1)))
-    for bb = 1:(length(cfg.blocks)-1)
-        terminator = ir[SSAValue(last(cfg.blocks[bb].stmts))][:stmt]
-        if terminator isa ReturnNode
-            cfg_insert_edge!(cfg, bb, length(cfg.blocks))
-        end
-    end
-    return cfg
-end
-
-visit_conditional_successors(callback, ir::IRCode, bb::Int) =
-    visit_conditional_successors(callback, construct_postdomtree(construct_augmented_cfg(ir)), ir, bb)
-visit_conditional_successors(callback, lazyagdomtrees::LazyAugmentedDomtrees, ir::IRCode, bb::Int) =
-    visit_conditional_successors(callback, get!(lazyagdomtrees, :postdomtree), ir, bb)
-function visit_conditional_successors(callback, postdomtree::PostDomTree, ir::IRCode, bb::Int)
+visit_conditional_successors(callback, ir::IRCode, bb::Int) = # used for test
+    visit_conditional_successors(callback, LazyPostDomtree(ir), ir, bb)
+function visit_conditional_successors(callback, lazypostdomtree::LazyPostDomtree, ir::IRCode, bb::Int)
     visited = BitSet((bb,))
     worklist = Int[bb]
     while !isempty(worklist)
@@ -573,7 +537,7 @@ function visit_conditional_successors(callback, postdomtree::PostDomTree, ir::IR
         for succ in ir.cfg.blocks[thisbb].succs
             succ in visited && continue
             push!(visited, succ)
-            if postdominates(postdomtree, succ, bb)
+            if postdominates(get!(lazypostdomtree), succ, bb)
                 # this successor is not conditional, so no need to visit it further
                 continue
             elseif callback(succ)
@@ -586,12 +550,40 @@ function visit_conditional_successors(callback, postdomtree::PostDomTree, ir::IR
     return false
 end
 
+struct AugmentedDomtree
+    cfg::CFG
+    domtree::DomTree
+end
+
+mutable struct LazyAugmentedDomtree
+    const ir::IRCode
+    agdomtree::AugmentedDomtree
+    LazyAugmentedDomtree(ir::IRCode) = new(ir)
+end
+
+function get!(lazyagdomtree::LazyAugmentedDomtree)
+    isdefined(lazyagdomtree, :agdomtree) && return lazyagdomtree.agdomtree
+    ir = lazyagdomtree.ir
+    cfg = copy(ir.cfg)
+    # Add a virtual basic block to represent the exit
+    push!(cfg.blocks, BasicBlock(StmtRange(0:-1)))
+    for bb = 1:(length(cfg.blocks)-1)
+        terminator = ir[SSAValue(last(cfg.blocks[bb].stmts))][:stmt]
+        if isa(terminator, ReturnNode) && isdefined(terminator, :val)
+            cfg_insert_edge!(cfg, bb, length(cfg.blocks))
+        end
+    end
+    domtree = construct_domtree(cfg)
+    return lazyagdomtree.agdomtree = AugmentedDomtree(cfg, domtree)
+end
+
 mutable struct PostOptAnalysisState
     const result::InferenceResult
     const ir::IRCode
     const inconsistent::BitSetBoundedMinPrioritySet
     const tpdum::TwoPhaseDefUseMap
-    const lazyagdomtrees::LazyAugmentedDomtrees
+    const lazypostdomtree::LazyPostDomtree
+    const lazyagdomtree::LazyAugmentedDomtree
     const ea_analysis_pending::Vector{Int}
     all_retpaths_consistent::Bool
     all_effect_free::Bool
@@ -602,8 +594,9 @@ mutable struct PostOptAnalysisState
     function PostOptAnalysisState(result::InferenceResult, ir::IRCode)
         inconsistent = BitSetBoundedMinPrioritySet(length(ir.stmts))
         tpdum = TwoPhaseDefUseMap(length(ir.stmts))
-        lazyagdomtrees = LazyAugmentedDomtrees(ir)
-        return new(result, ir, inconsistent, tpdum, lazyagdomtrees, Int[],
+        lazypostdomtree = LazyPostDomtree(ir)
+        lazyagdomtree = LazyAugmentedDomtree(ir)
+        return new(result, ir, inconsistent, tpdum, lazypostdomtree, lazyagdomtree, Int[],
                    true, true, nothing, true, true, false)
     end
 end
@@ -843,13 +836,13 @@ function ((; sv)::ScanStmt)(inst::Instruction, lstmt::Int, bb::Int)
             # inconsistent region.
             if !sv.result.ipo_effects.terminates
                 sv.all_retpaths_consistent = false
-            elseif visit_conditional_successors(sv.lazyagdomtrees, sv.ir, bb) do succ::Int
+            elseif visit_conditional_successors(sv.lazypostdomtree, sv.ir, bb) do succ::Int
                        return any_stmt_may_throw(sv.ir, succ)
                    end
                 # check if this `GotoIfNot` leads to conditional throws, which taints consistency
                 sv.all_retpaths_consistent = false
             else
-                cfg, domtree = get!(sv.lazyagdomtrees, :cfg), get!(sv.lazyagdomtrees, :domtree)
+                (; cfg, domtree) = get!(sv.lazyagdomtree)
                 for succ in iterated_dominance_frontier(cfg, BlockLiveness(sv.ir.cfg.blocks[bb].succs, nothing), domtree)
                     if succ == length(cfg.blocks)
                         # Phi node in the virtual exit -> We have a conditional
